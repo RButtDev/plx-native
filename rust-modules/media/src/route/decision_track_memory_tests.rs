@@ -207,12 +207,18 @@ mod through_build_stream {
     }
 
     /// The request lines with their per-run noise (session ids, tokens, query values) taken off.
+    ///
+    /// The PlayQueue's requests (its `GET /identity` when the id is not cached, then the POST) come
+    /// first and the route's follow in the order they were made: `build_stream` creates the queue
+    /// on a sibling thread beside the route, so where they land among the route's requests is
+    /// scheduling, not behaviour.
     pub(super) fn shape(requests: &[String]) -> Vec<String> {
-        requests
+        let (queue, route): (Vec<String>, Vec<String>) = requests
             .iter()
             .map(|r| r.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
             .map(|r| r.split('?').next().unwrap_or("").to_string())
-            .collect()
+            .partition(|r| r.starts_with("POST /playQueues") || r == "GET /identity");
+        queue.into_iter().chain(route).collect()
     }
 
     pub(super) fn decision(requests: &[String]) -> &String {
