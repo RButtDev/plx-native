@@ -193,7 +193,7 @@ pub struct Engine {
     // keyframe, not the drifted one. `rebase_drops` caps the rejections so a sparse-keyframe file or
     // a genuinely-failed av_seek can't hang the rebase.
     pub rebase_drops: i32,
-    pub seek_armed_at: u32, // SDL-ticks when the current in-place seek was armed (stuck watchdog)
+    pub seek_watch: SeekWatch, // the current in-place seek's stuck watchdog (see [`SeekWatch`])
     pub seek_retries: i32,  // cheap reopen-retries attempted before escalating to a full reload
     pub flushed: bool,      // Kodi m_flushed: set on an in-place seek flush; the first
     // post-flush keyframe triggers setTimeToDecode + sendSegmentEvent (the fresh GStreamer
@@ -1716,7 +1716,7 @@ fn start_bufferfeed_inner(
         // false (first keyframe is already ~0).
         rebase_pending: SHARED.seek_to_ns.load(Ordering::Relaxed) >= 0,
         rebase_drops: 0,
-        seek_armed_at: 0,
+        seek_watch: SeekWatch::default(),
         seek_retries: 0,
         flushed: false,
         presentation_rearm_pending: false,
@@ -2502,6 +2502,57 @@ impl FeedPace {
         };
         let run_on = now_ms.saturating_sub(at).min(FEED_PACE_CAP_MS) as i64;
         pres.saturating_add(run_on * 1_000_000)
+    }
+}
+
+/// How long an in-place seek may go with NO byte reaching the demuxer before the stuck watchdog
+/// calls its reopen lost, in ms. It must comfortably exceed a real reopen + `av_seek` + first
+/// keyframe on 4K HEVC over PMS (~700 ms): the watchdog's retry closes the demux socket, so a
+/// premature verdict KILLS an open that was about to succeed and restarts it — at 500 ms a rapid
+/// tap-burst self-DoS'd into the reload fallback every time (the `seek_rapid` harness cases).
+pub const SEEK_STUCK_MS: u32 = 1200;
+
+/// How long an in-place seek whose bytes ARE still arriving may run before the watchdog steps in
+/// anyway, in ms. A transfer that is moving is not a lost reopen: on a link slower than the dev
+/// set's (Wi-Fi, a high-bitrate remux, a busy disk on the server) reaching the landed keyframe can
+/// take longer than [`SEEK_STUCK_MS`], and the wall-clock-only watchdog then killed that open,
+/// restarted it twice and fell through to a full reload — turning a slow seek into several
+/// seconds of spinner. This bound keeps the escape for a transfer that moves but never anchors.
+pub const SEEK_SLOW_GIVE_UP_MS: u32 = 5000;
+
+/// **The in-place seek's stuck watchdog: when the seek was armed, and when the demuxer last
+/// received a byte** (`SHARED.dg_net_rx`, counted by both transports' read paths).
+///
+/// A seek is stuck when no byte has arrived for [`SEEK_STUCK_MS`] — the reopen was lost — or when
+/// it has run [`SEEK_SLOW_GIVE_UP_MS`] without anchoring even though bytes arrive. While a newer
+/// tap is waiting the plain [`SEEK_STUCK_MS`] wall clock applies, as it always did: the transfer
+/// in flight is for a target the viewer has already left, and the watchdog's retry adopts the
+/// newest one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeekWatch {
+    armed_at: u32,
+    rx: i64,
+    moved_at: u32,
+}
+
+impl SeekWatch {
+    /// Start (or restart) the watch at `now_ms`, with the demuxer's byte count at that moment.
+    pub fn arm(now_ms: u32, rx: i64) -> Self {
+        Self { armed_at: now_ms, rx, moved_at: now_ms }
+    }
+
+    /// Record the byte count `rx` seen at `now_ms` and answer whether the seek is stuck.
+    /// `newer_target`: a later tap is waiting to replace this seek's target.
+    pub fn stuck(&mut self, now_ms: u32, rx: i64, newer_target: bool) -> bool {
+        if rx != self.rx {
+            self.rx = rx;
+            self.moved_at = now_ms;
+        }
+        let since_armed = now_ms.wrapping_sub(self.armed_at);
+        if newer_target {
+            return since_armed > SEEK_STUCK_MS;
+        }
+        now_ms.wrapping_sub(self.moved_at) > SEEK_STUCK_MS || since_armed > SEEK_SLOW_GIVE_UP_MS
     }
 }
 
@@ -3427,6 +3478,76 @@ mod feed_pace_tests {
 }
 
 #[cfg(test)]
+mod seek_watch_tests {
+    use super::{SeekWatch, SEEK_SLOW_GIVE_UP_MS, SEEK_STUCK_MS};
+
+    /// One pump tick per 16 ms frame from `from` to `to`, with the demuxer's byte count each tick
+    /// given by `rx_at`; returns the first tick the watch called the seek stuck, if any.
+    fn first_stuck(watch: &mut SeekWatch, from: u32, to: u32, newer: bool, rx_at: impl Fn(u32) -> i64) -> Option<u32> {
+        (from..=to).step_by(16).find(|&now| watch.stuck(now, rx_at(now), newer))
+    }
+
+    /// **Regression: a slow but moving seek was killed at 1.2 s.** The wall-clock-only watchdog
+    /// called every in-place seek stuck [`SEEK_STUCK_MS`] after arming, whether or not its
+    /// transfer was progressing, so on a link where reaching the landed keyframe takes 2-3 s the
+    /// retry closed an open that was about to succeed, twice, and then reloaded. Bytes arriving
+    /// every tick for 3 s must not trip it.
+    #[test]
+    fn a_seek_whose_bytes_keep_arriving_is_not_stuck_at_the_old_deadline() {
+        let mut watch = SeekWatch::arm(1_000, 0);
+        let stuck = first_stuck(&mut watch, 1_000, 4_000, false, |now| (now - 1_000) as i64 * 4_000);
+        assert_eq!(stuck, None, "a transfer moving every tick is a slow seek, not a lost reopen");
+    }
+
+    /// A lost reopen — no byte arrives — is still called stuck at [`SEEK_STUCK_MS`], exactly as
+    /// before, so the cheap retry still fires on time.
+    #[test]
+    fn a_seek_with_no_bytes_is_stuck_after_the_stuck_deadline() {
+        let mut watch = SeekWatch::arm(1_000, 500);
+        let stuck = first_stuck(&mut watch, 1_000, 10_000, false, |_| 500).expect("a silent seek is stuck");
+        assert!(stuck > 1_000 + SEEK_STUCK_MS && stuck <= 1_000 + SEEK_STUCK_MS + 16, "stuck at {stuck}");
+    }
+
+    /// Bytes that stop arriving partway restart nothing: the verdict comes [`SEEK_STUCK_MS`] after
+    /// the LAST byte, not after arming.
+    #[test]
+    fn a_transfer_that_stalls_is_stuck_one_deadline_after_its_last_byte() {
+        let mut watch = SeekWatch::arm(0, 0);
+        let rx = |now: u32| now.min(2_000) as i64;
+        let stuck = first_stuck(&mut watch, 0, 10_000, false, rx).expect("a stalled transfer is stuck");
+        assert!(stuck > 2_000 + SEEK_STUCK_MS && stuck <= 2_000 + SEEK_STUCK_MS + 32, "stuck at {stuck}");
+    }
+
+    /// A transfer that keeps moving but never anchors still gets the escape, at
+    /// [`SEEK_SLOW_GIVE_UP_MS`].
+    #[test]
+    fn a_moving_transfer_that_never_anchors_is_given_up_on() {
+        let mut watch = SeekWatch::arm(0, 0);
+        let stuck = first_stuck(&mut watch, 0, 20_000, false, |now| now as i64).expect("the escape fires");
+        assert!(stuck > SEEK_SLOW_GIVE_UP_MS && stuck <= SEEK_SLOW_GIVE_UP_MS + 16, "stuck at {stuck}");
+    }
+
+    /// With a newer tap waiting the plain wall clock applies: the transfer in flight is for a
+    /// target the viewer already left, so it is abandoned for the newest one on the old schedule.
+    #[test]
+    fn a_newer_tap_keeps_the_wall_clock_deadline() {
+        let mut watch = SeekWatch::arm(0, 0);
+        let stuck = first_stuck(&mut watch, 0, 10_000, true, |now| now as i64).expect("the coalesced tap is adopted");
+        assert!(stuck > SEEK_STUCK_MS && stuck <= SEEK_STUCK_MS + 16, "stuck at {stuck}");
+    }
+
+    /// The player clock is a wrapping u32 of ms; a seek armed just before it wraps is judged on
+    /// elapsed time, not on the raw numbers.
+    #[test]
+    fn the_watch_survives_the_tick_counter_wrapping() {
+        let armed = u32::MAX - 100;
+        let mut watch = SeekWatch::arm(armed, 0);
+        assert!(!watch.stuck(armed.wrapping_add(SEEK_STUCK_MS), 0, false));
+        assert!(watch.stuck(armed.wrapping_add(SEEK_STUCK_MS + 1), 0, false));
+    }
+}
+
+#[cfg(test)]
 mod native_lifecycle_proof_tests {
     use super::{native_object_disposition, NativeObjectDisposition};
 
@@ -4194,7 +4315,7 @@ mod prime_livelock_tests {
             eos_pushed: false,
             rebase_pending: false,
             rebase_drops: 0,
-            seek_armed_at: 0,
+            seek_watch: SeekWatch::default(),
             seek_retries: 0,
                 flushed: false,
             presentation_rearm_pending: false,

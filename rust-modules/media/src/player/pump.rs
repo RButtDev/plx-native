@@ -2,7 +2,7 @@
 //! plex_run: the pending-seek handler, the ACB-bind state machine (Stage), and the
 //! feed dispatch. All ACB/Starfish control calls happen here on the main thread.
 use super::engine::{
-    arm_live_clock_prime, drain_aq, feed_both_lanes, feed_sample, Engine, Source,
+    arm_live_clock_prime, drain_aq, feed_both_lanes, feed_sample, Engine, SeekWatch, Source,
 };
 use super::shared::{HlsPauseCompletion, HlsPrimeKind, HlsSeekPause, Stage};
 use super::{seek_mode, SeekMode, ACB_OK, SHARED, TX};
@@ -105,6 +105,11 @@ pub(super) fn seek_reloads(mode: SeekMode) -> bool {
 
 fn take_coalesced() -> u32 {
     TX.seek_reqs.swap(0, Relaxed).saturating_sub(1)
+}
+
+/// (Re)start the in-place seek's stuck watchdog at `now`, from the demuxer's byte count now.
+fn arm_seek_watch(eng: &mut Engine, now: u32) {
+    eng.seek_watch = SeekWatch::arm(now, SHARED.dg_net_rx.load(Relaxed));
 }
 
 fn prime_before_play(rebase_pending: bool, segmented_hls: bool) -> bool {
@@ -1115,7 +1120,7 @@ fn settle_paused_seek(pa: &mut super::adapter::PlayerAdapter, now: u32) {
             // prime's Play: give the hold back to the prime first (it Plays one frame, then
             // `finish_paused_seek` re-pauses).
             if SHARED.hand_hold_to_seek_prime() && TX.own_paused_seek(target) {
-                eng.seek_armed_at = now;
+                arm_seek_watch(eng, now);
                 #[cfg(test)]
                 MID_SEEK_CLAIMS.fetch_add(1, Relaxed);
                 super::log("seek: viewer paused mid-seek; the pump opened the preroll");
@@ -1575,27 +1580,24 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
     // ---------- an in-place seek is still resolving (flushed, not yet re-anchored): COALESCE.
     // Firing another now would race the demux reopen (rapid tap-seeks) and the rebase guard would
     // then eat everything → stuck. Hold the latest requested target (it stays in TX.seek_to_ns) and
-    // process it once this seek anchors. If it hasn't anchored within SEEK_STUCK_MS the reopen was
-    // lost — first RETRY the reopen cheaply (re-interrupt the demuxer + re-arm), and only fall back
-    // to a full (slow) reload if the retries also fail.
-    // SEEK_STUCK_MS must comfortably exceed a real reopen+av_seek+first-keyframe on 4K HEVC over
-    // PMS (~700ms): the retry closes the demux socket, so a premature watchdog KILLS an open that
-    // was about to succeed and restarts it — at 500ms a rapid tap-burst self-DoS'd into the
-    // reload fallback every time (caught by the seek_rapid harness cases).
+    // process it once this seek anchors. If it hasn't anchored and the watchdog calls it stuck
+    // (`engine::SeekWatch`: no byte for SEEK_STUCK_MS, or SEEK_SLOW_GIVE_UP_MS of a transfer that
+    // moves but never anchors) the reopen was lost — first RETRY the reopen cheaply (re-interrupt
+    // the demuxer + re-arm), and only fall back to a full (slow) reload if the retries also fail.
     // A claim's worker owns `ControlPhase::Applying` and has no vocabulary for a seek reload
     // reaching in and replacing the encoder/engine out from under it (see `route::flight_outstanding`'s own
     // doc). Skip both this branch and the plain pending-seek branch below while one is in flight —
     // `TX.seek_to_ns` stays exactly where it is and the retranscode/native-audio tail re-checks it
     // once the claim lands (`commit_or_carry_seek`).
-    const SEEK_STUCK_MS: u32 = 1200;
+    //
     // The watchdog measures time the seek COULD progress. While the feed gate is shut (a viewer
     // Pause with no preroll open) the keyframe can never be fed, so the reopen is not "lost" and
     // neither a retry nor a reload (itself gated the same way) could help: keep the clock at zero.
     if eng.flushed && eng.rebase_pending && !TX.feed_allowed() {
-        eng.seek_armed_at = now;
+        arm_seek_watch(eng, now);
     }
     if eng.flushed && eng.rebase_pending
-        && now.wrapping_sub(eng.seek_armed_at) > SEEK_STUCK_MS
+        && eng.seek_watch.stuck(now, SHARED.dg_net_rx.load(Relaxed), TX.seek_to_ns.load(Relaxed) >= 0)
         && !crate::route::flight_outstanding()
     {
         // Adopt the NEWEST coalesced target if later taps landed while this seek was resolving
@@ -1621,7 +1623,7 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
             eng.seek_retries += 1;
             SHARED.seek_to_ns.store(tgt, Release); // re-publish; the demux thread seeks on it
             SHARED.seek_target_ns.store(tgt, Relaxed); // rebase guard keys on the retried target
-            eng.seek_armed_at = now;
+            arm_seek_watch(eng, now);
             super::log(&format!(
                 "seek: in-place stuck → retry reopen at {}s (#{}) coalesced={}",
                 tgt / 1_000_000_000,
@@ -1773,7 +1775,7 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         eng.rebase_drops = 0;
         // A seek armed under a viewer Pause: the pump opens the preroll and closes it on the landing.
         own_seek_under_pause(t);
-        eng.seek_armed_at = now; // stuck-watchdog start (see the coalesce/escape above)
+        arm_seek_watch(eng, now); // stuck-watchdog start (see the coalesce/escape above)
         eng.seek_retries = 0;
         eng.max_fed_video_pts = 0;
         eng.max_fed_audio_pts = 0;
