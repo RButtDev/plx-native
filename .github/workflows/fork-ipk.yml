@@ -1,0 +1,71 @@
+# Personal-fork build: one ARM .ipk, on demand, with none of the upstream release machinery.
+#
+# build-package.yml is the upstream pipeline and it assumes the maintainer's repository: it needs
+# the production telemetry VARIABLES and a SENTRY_AUTH_TOKEN, and it uploads debug files. A fork
+# has neither, so this runs the same toolchain setup and the same `make` invocation and stops at
+# the package. No telemetry credentials are passed, so the binary compiles telemetry out
+# (`telemetry::sender::configured()` is false).
+#
+# `flavor: debug` (the default) installs BESIDE the store/stable app as com.beb.plxnative.debug,
+# with its own tile and sign-in, so a test build cannot replace the app in daily use.
+# `flavor: stable` packages com.beb.plxnative and replaces it in place.
+name: Fork .ipk build
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'Which install: debug (side by side) or stable (replaces the installed app)'
+        type: choice
+        options: [debug, stable]
+        default: debug
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # The webOS NDK publishes no linux-x86_64 host build; this is the runner upstream uses.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned Rust and the armv7 target
+        uses: ./.github/actions/rust-toolchain
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rust-modules
+          key: armv7
+
+      - name: Cache the pinned downloads
+        uses: ./.github/actions/deps-cache
+
+      - id: ndk
+        uses: ./.github/actions/webos-ndk
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/ffmpeg-prefix
+            vendor/ffmpeg-build
+          key: ffmpeg-${{ runner.arch }}-${{ hashFiles('ci/build-ffmpeg.sh', 'ci/deps.py', 'ci/dependencies.json') }}
+
+      - name: Build + package
+        env:
+          WEBOS_SDK: ${{ steps.ndk.outputs.sdk-dir }}
+          RELEASE: "1"
+          FLAVOR: ${{ inputs.flavor }}
+        run: |
+          make -j"$(nproc)"
+          make ipk
+          appid=$(make -s print-appid FLAVOR="$FLAVOR")
+          ls "pkg/${appid}"_*_arm.ipk
+          echo "built $(git rev-parse --short HEAD) as $appid"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plxnative-${{ inputs.flavor }}-ipk
+          path: pkg/*.ipk
+          if-no-files-found: error
