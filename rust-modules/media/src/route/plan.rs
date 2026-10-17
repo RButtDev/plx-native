@@ -1493,20 +1493,56 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     // a PlayQueue so the server tracks this as a real player with a playQueueItemID.
     let session = new_sess(rk);
     plan.sess = session.clone();
-    if !rk.is_empty() && !env.preview {
-        let q = resolve_playqueue(
-            client,
-            rk,
-            &session,
-            &env.machine_id,
-            !env.omit_queue_continuous,
-        );
-        plan.machine_id = q.machine_id;
-        plan.pq_id = q.id;
-        plan.pq_item_id = q.item_id;
-        plan.up_next = q.up_next;
-        plan.queue = q.rows;
+    if rk.is_empty() || env.preview {
+        return route_plan(off, rk, part, vcodec, acodec, env, plan, client, session, forced, playback_quality);
     }
+    // **The PlayQueue overlaps the route instead of running in front of it.** `POST /playQueues`
+    // (and, on a server whose id is not cached yet, the `GET /` for its machineIdentifier) feeds
+    // only the timeline ids, Up Next and the queue rows, and nothing in `route_plan` reads any of
+    // them, so it runs on a sibling thread while the metadata GET and `/decision` run here: one
+    // whole server round trip less between the press and the Load. A refused spawn falls back to
+    // the serial call, after the route, so the queue is never skipped.
+    let pq_session = session.clone();
+    let pq_cached_mid = env.machine_id.clone();
+    let continuous = !env.omit_queue_continuous;
+    let (mut plan, q) = std::thread::scope(|s| {
+        let queue_h = std::thread::Builder::new()
+            .name("resolve-queue".into())
+            .spawn_scoped(s, move || resolve_playqueue(client, rk, &pq_session, &pq_cached_mid, continuous));
+        let plan = route_plan(off, rk, part, vcodec, acodec, env, plan, client, session, forced, playback_quality);
+        let q = match queue_h {
+            // A panicking queue worker costs the queue (as a failed POST does), never the play.
+            Ok(h) => h.join().unwrap_or_default(),
+            Err(_) => resolve_playqueue(client, rk, &plan.sess, &env.machine_id, continuous),
+        };
+        (plan, q)
+    });
+    plan.machine_id = q.machine_id;
+    plan.pq_id = q.id;
+    plan.pq_item_id = q.item_id;
+    plan.up_next = q.up_next;
+    plan.queue = q.rows;
+    plan
+}
+
+/// The rest of [`build_stream`] once the session id exists: the playing item, the server's
+/// `/decision` and the route it implies. Runs beside the PlayQueue (see `build_stream`), so it
+/// must not read `plan.machine_id`, `pq_id`, `pq_item_id`, `up_next` or `queue`; `build_stream`
+/// fills those after both finish.
+#[allow(clippy::too_many_arguments)]
+fn route_plan(
+    off: &plx_base::task::OffFrame,
+    rk: &str,
+    part: &str,
+    vcodec: &str,
+    acodec: &str,
+    env: &ResolveEnv,
+    mut plan: Plan,
+    client: &'static plx_plex::plex::Client,
+    session: String,
+    forced: bool,
+    playback_quality: Quality,
+) -> Plan {
     // the playing item's OWN track lists (menu + audio pick + esInfo fps read them) — the
     // loaded detail can be a different item (show page / straight-from-Home play)
     // detail already had this item's streams — no GET
